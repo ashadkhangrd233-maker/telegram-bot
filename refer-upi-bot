@@ -1,0 +1,81 @@
+from telegram.ext import *
+from telegram import *
+
+TOKEN = "8436586786:AAGPi3MK3q01cBLvoa0HJl4CFV5m03z1d7g"
+ADMIN_ID = 16718205476   # <-- Yaha apna Telegram ID daalo
+
+user_upi = {}
+
+def start(update, context):
+    keyboard = [
+        [KeyboardButton("💰 Balance"), KeyboardButton("🎁 Bonus")],
+        [KeyboardButton("👥 Refer & Earn")],
+        [KeyboardButton("🏧 Withdraw")],
+        [KeyboardButton("🔗 Add UPI")]
+    ]
+
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    update.message.reply_text("Welcome! Choose an option below:", reply_markup=reply_markup)
+
+def handle_message(update, context):
+    user = update.message.from_user
+    text = update.message.text
+
+    # Add UPI
+    if text == "🔗 Add UPI":
+        update.message.reply_text("Send your UPI ID (example: name@upi)")
+        return
+
+    # Save UPI
+    if "@" in text and "." not in text:
+        user_upi[user.id] = text
+        update.message.reply_text(f"UPI saved: {text}")
+        return
+
+    # Balance
+    if text == "💰 Balance":
+        update.message.reply_text("Your balance: ₹0")
+    
+    # Bonus
+    elif text == "🎁 Bonus":
+        update.message.reply_text("Your bonus: ₹0")
+    
+    # Refer
+    elif text == "👥 Refer & Earn":
+        link = f"https://t.me/{context.bot.username}?start={user.id}"
+        update.message.reply_text("Share link to earn:\n" + link)
+
+    # Withdraw
+    elif text == "🏧 Withdraw":
+        if user.id not in user_upi:
+            update.message.reply_text("Please add UPI first using 🔗 Add UPI")
+        else:
+            update.message.reply_text("Enter withdraw amount (₹20 minimum):")
+        return
+
+    # Amount entered
+    elif text.isdigit():
+        amt = int(text)
+        if amt < 20:
+            update.message.reply_text("Minimum withdraw is ₹20.")
+        else:
+            upi = user_upi.get(user.id, "Not Added")
+
+            # Notify admin
+            context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"💸 Withdrawal Request\nUser: {user.first_name}\nUser ID: {user.id}\nUPI: {upi}\nAmount: ₹{amt}"
+            )
+
+            update.message.reply_text("Withdrawal request sent. Admin will pay manually.")
+    
+    else:
+        update.message.reply_text("Invalid option. Use the buttons below.")
+
+updater = Updater(TOKEN, use_context=True)
+dispatcher = updater.dispatcher
+
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(MessageHandler(Filters.text, handle_message))
+
+updater.start_polling()
