@@ -1,0 +1,414 @@
+# bot.py
+# Safe points-based wallet bot (no monetary payout claims)
+# Requires: python-telegram-bot==20.4
+
+import json
+import time
+import logging
+from pathlib import Path
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+    ConversationHandler,
+)
+
+# -------- CONFIG --------
+DATA_FILE = Path("data.json")
+MIN_WITHDRAW_POINTS = 20          # minimum points required to make a withdraw request
+DAILY_BONUS = 2                   # points given for daily bonus
+REFERRAL_POINTS = 5               # points given per referral (as points, not cash)
+
+# Put sensitive values in ENV (Railway / Replit / Termux env)
+# BOT_TOKEN and ADMIN_ID must be set as environment variables for deployment.
+# When testing locally you can fill them here (NOT recommended for production).
+import os
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID")
+
+# -------------------------
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# States
+SUBMIT_UPI, WITHDRAW_AMOUNT = range(2)
+
+
+def load_data():
+    if not DATA_FILE.exists():
+        data = {"users": {}, "withdraw_requests": []}
+        save_data(data)
+        return data
+    with DATA_FILE.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_data(data):
+    with DATA_FILE.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def ensure_user(data, user_id, username=None):
+    users = data.setdefault("users", {})
+    uid = str(user_id)
+    if uid not in users:
+        users[uid] = {
+            "points": 0,
+            "upi": None,
+            "last_bonus": 0,
+            "referrer": None,
+            "referrals": 0,
+        }
+    if username:
+        users[uid].setdefault("username", username)
+    return users[uid]
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    data = load_data()
+    ensure_user(data, user.id, user.username)
+    save_data(data)
+
+    kb = [
+        [KeyboardButton("💰 Balance"), KeyboardButton("🎁 Bonus")],
+        [KeyboardButton("👥 Refer"), KeyboardButton("🏧 Submit UPI")],
+        [KeyboardButton("💳 Withdraw")],
+    ]
+    await update.message.reply_text(
+        "Welcome! This is a POINTS wallet (safe version).\n"
+        "Earn points via refer and daily bonus. Withdrawals are requests that are reviewed by admin.",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True),
+    )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+    if text in ("balance", "💰 balance"):
+        await cmd_balance(update, context)
+    elif text in ("bonus", "🎁 bonus"):
+        await cmd_bonus(update, context)
+    elif text in ("refer", "👥 refer"):
+        await cmd_refer(update, context)
+    elif text in ("submit upi", "🏧 submit upi"):
+        await cmd_submit_upi(update, context)
+    elif text in ("withdraw", "💳 withdraw"):
+        await cmd_withdraw(update, context)
+    else:
+        await update.message.reply_text("Use the buttons: Balance, Bonus, Refer, Submit UPI, Withdraw.")
+
+
+async def cmd_balance(update: Update | None, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(update, Update) and update.message:
+        user = update.effective_user
+        data = load_data()
+        u = ensure_user(data, user.id, user.username)
+        save_data(data)
+        await update.message.reply_text(f"💰 Balance: {u.get('points', 0)} points")
+
+
+async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    data = load_data()
+    u = ensure_user(data, user.id, user.username)
+    now = int(time.time())
+    if now - u.get("last_bonus", 0) >= 24 * 3600:
+        u["points"] = u.get("points", 0) + DAILY_BONUS
+        u["last_bonus"] = now
+        save_data(data)
+        await update.message.reply_text(f"🎁 Bonus Added +{DAILY_BONUS} points")
+    else:
+        seconds_left = 24 * 3600 - (now - u.get("last_bonus", 0))
+        hours = seconds_left // 3600
+        await update.message.reply_text(f"⏳ Bonus available in {hours} hours")
+
+
+async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    data = load_data()
+    ensure_user(data, user.id, user.username)
+    save_data(data)
+    bot_username = (await context.bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start={user.id}"
+    await update.message.reply_text(
+        f"🔗 Your Refer Link:\n{link}\n\nPer Refer: {REFERRAL_POINTS} points\n(When a new user starts with your link you get points)",
+    )
+
+
+async def start_with_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Called when user opens bot with ?start=<referrer_id>
+    args = context.args
+    user = update.effective_user
+    data = load_data()
+    u = ensure_user(data, user.id, user.username)
+    if args:
+        try:
+            ref_id = int(args[0])
+            if ref_id != user.id:
+                ref = ensure_user(data, ref_id, None)
+                # only credit if this is first time user
+                if not u.get("referrer"):
+                    u["referrer"] = ref_id
+                    ref["points"] = ref.get("points", 0) + REFERRAL_POINTS
+                    ref["referrals"] = ref.get("referrals", 0) + 1
+                    save_data(data)
+                    # notify referrer
+                    await context.bot.send_message(
+                        chat_id=ref_id,
+                        text=f"🎉 You earned {REFERRAL_POINTS} points for referring {user.first_name}!",
+                    )
+        except Exception:
+            pass
+    await start(update, context)
+
+
+async def cmd_submit_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Send your UPI ID (example: name@bank). This will be forwarded to admin for review.")
+    return SUBMIT_UPI
+
+
+async def handle_upi_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.strip()
+    data = load_data()
+    u = ensure_user(data, user.id, user.username)
+    # basic check for '@' character
+    if "@" not in text or len(text) > 60:
+        await update.message.reply_text("Invalid UPI format. Send again (example: name@bank).")
+        return SUBMIT_UPI
+    u["upi"] = text
+    save_data(data)
+    await update.message.reply_text("✅ UPI Submitted. Admin will be notified.")
+    # notify admin
+    if ADMIN_ID:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"✉️ New UPI Submitted:\nUser: {user.id} ({user.full_name})\nUPI: {text}",
+        )
+    return ConversationHandler.END
+
+
+async def cmd_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    data = load_data()
+    u = ensure_user(data, user.id, user.username)
+    if u.get("points", 0) < MIN_WITHDRAW_POINTS:
+        await update.message.reply_text(f"❌ Minimum withdraw {MIN_WITHDRAW_POINTS} points")
+        return ConversationHandler.END
+    await update.message.reply_text("Enter amount to withdraw (in points):")
+    return WITHDRAW_AMOUNT
+
+
+async def handle_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.strip()
+    data = load_data()
+    u = ensure_user(data, user.id, user.username)
+    try:
+        amount = int(float(text))
+    except Exception:
+        await update.message.reply_text("Invalid amount. Enter a number.")
+        return WITHDRAW_AMOUNT
+    if amount < MIN_WITHDRAW_POINTS:
+        await update.message.reply_text(f"❌ Minimum withdraw {MIN_WITHDRAW_POINTS} points")
+        return ConversationHandler.END
+    if amount > u.get("points", 0):
+        await update.message.reply_text("❌ You do not have enough points.")
+        return ConversationHandler.END
+    # Add withdraw request
+    req = {
+        "id": int(time.time() * 1000),
+        "user_id": user.id,
+        "username": user.username,
+        "amount": amount,
+        "upi": u.get("upi"),
+        "time": int(time.time()),
+        "status": "pending",
+    }
+    data.setdefault("withdraw_requests", []).append(req)
+    save_data(data)
+    await update.message.reply_text("📮 Withdraw request submitted. Admin will review it.")
+    # notify admin
+    if ADMIN_ID:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"📥 New Withdraw Request\n"
+                f"ReqID: {req['id']}\nUser: {user.id} ({user.full_name})\nAmount: {amount} points\nUPI: {req['upi']}\n\n"
+                "Commands for admin:\n"
+                f"/requests  - list pending\n"
+                f"/approve {req['id']}  - approve and deduct points\n"
+                f"/reject {req['id']}  - reject request"
+            ),
+        )
+    return ConversationHandler.END
+
+
+# ------- ADMIN COMMANDS -------
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != ADMIN_ID:
+            await update.message.reply_text("Unauthorized.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
+@admin_only
+async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    pending = [r for r in data.get("withdraw_requests", []) if r["status"] == "pending"]
+    if not pending:
+        await update.message.reply_text("No pending requests.")
+        return
+    text = "Pending withdraw requests:\n"
+    for r in pending:
+        text += f"ReqID:{r['id']} User:{r['user_id']} Amount:{r['amount']} UPI:{r.get('upi')}\n"
+    await update.message.reply_text(text)
+
+
+@admin_only
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /approve <reqid>")
+        return
+    reqid = args[0]
+    data = load_data()
+    for r in data.get("withdraw_requests", []):
+        if str(r["id"]) == str(reqid) and r["status"] == "pending":
+            # Deduct points
+            uid = str(r["user_id"])
+            users = data.setdefault("users", {})
+            users.setdefault(uid, {"points": 0})
+            if users[uid].get("points", 0) < r["amount"]:
+                await update.message.reply_text("User has insufficient points.")
+                return
+            users[uid]["points"] -= r["amount"]
+            r["status"] = "approved"
+            r["admin"] = update.effective_user.id
+            save_data(data)
+            # notify user
+            try:
+                await context.bot.send_message(
+                    chat_id=r["user_id"],
+                    text=f"✅ Your withdraw request {r['id']} for {r['amount']} points was approved by admin.\nAdmin will contact you for UPI payment (external).",
+                )
+            except Exception:
+                pass
+            await update.message.reply_text(f"Approved request {reqid}.")
+            return
+    await update.message.reply_text("Request not found or not pending.")
+
+
+@admin_only
+async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /reject <reqid>")
+        return
+    reqid = args[0]
+    data = load_data()
+    for r in data.get("withdraw_requests", []):
+        if str(r["id"]) == str(reqid) and r["status"] == "pending":
+            r["status"] = "rejected"
+            r["admin"] = update.effective_user.id
+            save_data(data)
+            # notify user
+            try:
+                await context.bot.send_message(
+                    chat_id=r["user_id"],
+                    text=f"❌ Your withdraw request {r['id']} was rejected by admin.",
+                )
+            except Exception:
+                pass
+            await update.message.reply_text(f"Rejected request {reqid}.")
+            return
+    await update.message.reply_text("Request not found or not pending.")
+
+
+@admin_only
+async def cmd_credit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /credit <user_id> <amount>")
+        return
+    try:
+        uid = str(int(args[0]))
+        amt = int(float(args[1]))
+    except Exception:
+        await update.message.reply_text("Invalid args.")
+        return
+    data = load_data()
+    users = data.setdefault("users", {})
+    users.setdefault(uid, {"points": 0})
+    users[uid]["points"] = users[uid].get("points", 0) + amt
+    save_data(data)
+    await update.message.reply_text(f"Credited {amt} points to user {uid}.")
+    try:
+        await context.bot.send_message(chat_id=int(uid), text=f"➕ Admin credited {amt} points to your account.")
+    except Exception:
+        pass
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Commands:\n"
+        "/start - start\n"
+        "Buttons: Balance, Bonus, Refer, Submit UPI, Withdraw\n"
+        "Admin commands (admin only): /requests, /approve <reqid>, /reject <reqid>, /credit <user_id> <amount>"
+    )
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN env var not set")
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("(?i)^(🏧 submit upi|submit upi|🏧 Submit UPI)$") | filters.Regex("(?i)^submit upi$"), cmd_submit_upi),
+            MessageHandler(filters.Regex("(?i)^(💳 withdraw|withdraw|Withdraw)$"), cmd_withdraw),
+        ],
+        states={
+            SUBMIT_UPI: [MessageHandler(filters.TEXT & (~filters.COMMAND), handle_upi_submission)],
+            WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & (~filters.COMMAND), handle_withdraw_amount)],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+    )
+
+    application.add_handler(CommandHandler("start", start_with_ref))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("balance", cmd_balance))
+    application.add_handler(CommandHandler("bonus", cmd_bonus))
+    application.add_handler(CommandHandler("refer", cmd_refer))
+    application.add_handler(CommandHandler("submit_upi", cmd_submit_upi))
+    application.add_handler(CommandHandler("withdraw", cmd_withdraw))
+    application.add_handler(conv)
+
+    # admin
+    application.add_handler(CommandHandler("requests", cmd_requests))
+    application.add_handler(CommandHandler("approve", cmd_approve))
+    application.add_handler(CommandHandler("reject", cmd_reject))
+    application.add_handler(CommandHandler("credit", cmd_credit))
+
+    # friendly text handler for buttons
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+
+    logger.info("Bot starting...")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
